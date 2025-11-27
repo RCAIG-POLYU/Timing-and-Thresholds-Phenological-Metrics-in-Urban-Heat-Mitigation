@@ -1,0 +1,449 @@
+!pip install rasterio
+!pip install catboost shap -q
+import os
+from google.colab import drive
+import rasterio
+import matplotlib.pyplot as plt
+
+# Mount Google Drive
+drive.mount('/content/drive')
+import os
+import re
+import pandas as pd
+from collections import defaultdict
+
+# Root directory (according to your path)
+ROOT = "/content/drive/MyDrive/anature_revised/data"
+
+
+ALLOW_EXT = {".tif", ".tiff"}
+
+
+all_entries = sorted([d for d in os.listdir(ROOT) if os.path.isdir(os.path.join(ROOT, d))])
+print(f"Number of city folders found：{len(all_entries)}")
+if not all_entries:
+    raise SystemExit("No city folders were found in the root directory. Please check the ROOT path")
+
+
+def list_tifs(city_dir):
+    full = os.path.join(ROOT, city_dir)
+    files = []
+    for name in os.listdir(full):
+        p = os.path.join(full, name)
+        if os.path.isfile(p):
+            ext = os.path.splitext(name)[1].lower()
+            if ext in ALLOW_EXT:
+                files.append(name)
+    return sorted(files)
+
+city_to_files = {city: list_tifs(city) for city in all_entries}
+
+
+def strip_city_prefix(city, filename):
+
+    pat = re.compile(rf"^{re.escape(city)}_", re.IGNORECASE)
+    return re.sub(pat, "", filename, count=1)
+
+city_to_keys = {}
+for city, files in city_to_files.items():
+    keys = [strip_city_prefix(city, fn) for fn in files]
+    city_to_keys[city] = keys
+
+
+counts = {city: len(files) for city, files in city_to_files.items()}
+df_counts = pd.DataFrame({"city": list(counts.keys()),
+                          "tif_count": list(counts.values())}).sort_values("city")
+print("\n===  .tif number ===")
+print(df_counts.to_string(index=False))
+
+
+ref_city = max(counts, key=counts.get)
+ref_keys = set(city_to_keys[ref_city])
+print(f"\nReference city (with the highest number of TIF files)：{ref_city}（{counts[ref_city]} 个文件）")
+
+missing_records = []
+extra_records   = []
+
+for city, keys in city_to_keys.items():
+    keyset = set(keys)
+    missing = sorted(list(ref_keys - keyset))
+    extra   = sorted(list(keyset - ref_keys))
+    if missing:
+        for k in missing:
+            missing_records.append({"city": city, "missing_key": k})
+    if extra:
+        for k in extra:
+            extra_records.append({"city": city, "extra_key": k})
+
+df_missing = pd.DataFrame(missing_records)
+df_extra   = pd.DataFrame(extra_records)
+
+print("no miss" if df_missing.empty else df_missing.head(20).to_string(index=False))
+
+
+print("no more" if df_extra.empty else df_extra.head(20).to_string(index=False))
+
+all_equal = all(len(set(v)) == len(ref_keys) and set(city_to_keys[c]) == ref_keys for c, v in city_to_files.items())
+if all_equal:
+    print("\n✅ Conclusion: The .tif collections contained within all city folders are entirely consistent.")
+else:
+    print("\n❗Conclusion: Inconsistencies exist. Please rectify these according to the above list of missing/extra files.")
+
+
+df_counts.to_csv(out_counts, index=False, encoding="utf-8")
+if df_missing.empty:
+    pd.DataFrame(columns=["city", "missing_key"]).to_csv(out_missing, index=False, encoding="utf-8")
+else:
+    df_missing.to_csv(out_missing, index=False, encoding="utf-8")
+if df_extra.empty:
+    pd.DataFrame(columns=["city", "extra_key"]).to_csv(out_extra, index=False, encoding="utf-8")
+else:
+    df_extra.to_csv(out_extra, index=False, encoding="utf-8")
+
+print(f"\n📄 saved：\n- {out_counts}\n- {out_missing}\n- {out_extra}")
+
+
+# -*- coding: utf-8 -*-
+import os, re, math, gc
+from collections import defaultdict
+import numpy as np
+import rasterio
+from rasterio.enums import Resampling
+from tqdm import tqdm
+
+# ==============================
+ROOT = "/content/drive/MyDrive/anature_revised/data" 
+SPATIAL_SUBSAMPLE = 1         
+SAMPLE_FRAC       = 0.40       
+RANDOM_SEED       = 42
+
+
+CITY_LIMIT        = 100                 
+MIN_CITY_PIXELS   = 50              
+CITY_WHITELIST    = []                
+
+NTL_THRESHOLD = 0.0
+NTL_KEYS = {"NTL","VIIRS","NIGHT","NIGHTLIGHT"}
+
+CHANNEL_WHITELIST = set()
+
+
+TARGET_PREFS = ("LST.LSTD", "LST.LST_DAY", "LST_DAY")  
+EXCLUDE_LST_FEATURES = True 
+
+os.environ["GDAL_NUM_THREADS"] = "ALL_CPUS"
+os.environ["GDAL_CACHEMAX"]   = "1024"
+ALLOW_EXT = {".tif",".tiff"}
+
+OUT_NPZ = "/content/ALLCITIES_train_xy_monthly_S{}_{}pct_ntlmask_TOP{}.npz".format(
+    SPATIAL_SUBSAMPLE, int(SAMPLE_FRAC*100), CITY_LIMIT
+)
+
+# =============== ===============
+DATE8 = re.compile(r"(?:^|_)(\d{8})(?:_|$)")
+SUBVAR = re.compile(r"^[A-Za-z0-9]+")
+
+def list_cities(root):
+    return sorted([d for d in os.listdir(root) if os.path.isdir(os.path.join(root, d))])
+
+def apply_city_whitelist(all_cities, whitelist):
+    if not whitelist:
+        return all_cities
+
+    picked = [c for c in whitelist if c in all_cities]
+    rest   = [c for c in all_cities if c not in picked]
+    return picked + rest
+
+def city_files(root, city):
+    cdir = os.path.join(root, city)
+    files = [f for f in sorted(os.listdir(cdir))
+             if os.path.isfile(os.path.join(cdir,f)) and os.path.splitext(f)[1].lower() in ALLOW_EXT]
+    return cdir, files
+
+def infer_var_from_filename(filename, city):
+    base = re.sub(rf"^{re.escape(city)}_", "", filename, flags=re.IGNORECASE)
+    return base.split("_")[0].upper()
+
+def yyyymm_from_yyyymmdd(d8):
+    return d8[:6] if (d8 and len(d8)==8) else None
+
+def parse_band_desc(desc, major_var):
+    subvar, mkey = None, "STATIC"
+    if desc:
+        m_date = DATE8.search(desc)
+        if m_date:
+            mm = yyyymm_from_yyyymmdd(m_date.group(1))
+            mkey = mm if mm else "STATIC"
+        m_sv = SUBVAR.search(desc)
+        if m_sv:
+            subvar = m_sv.group(0).upper()
+    if subvar is None:
+        subvar = major_var
+    return f"{major_var}.{subvar}", mkey  # channel, YYYYMM/STATIC
+
+def get_band_descs(ds):
+    descs = list(ds.descriptions) if ds.descriptions and any(ds.descriptions) else [None]*ds.count
+    if len(descs)!=ds.count:
+        descs = (descs + [None]*ds.count)[:ds.count]
+    return descs
+
+def out_hw(h,w,s):
+    return math.ceil(h/s), math.ceil(w/s)
+
+def read_downsample(ds, b, oh, ow):
+    arr = ds.read(b, masked=True, out_shape=(oh,ow), resampling=Resampling.average).astype(np.float32)
+    if np.ma.isMaskedArray(arr):
+        arr = arr.filled(np.nan)
+    return arr
+
+def choose_target_channel(channels):
+    for pref in TARGET_PREFS:
+        for ch in channels:
+            if ch.upper().endswith(pref.upper()):
+                return ch
+    for ch in channels:
+        if "LST" in ch.upper() and "LSTN" not in ch.upper():
+            return ch
+    for ch in channels:
+        if "LST" in ch.upper():
+            return ch
+    return None
+
+def find_ntl_index(channels):
+    for ch in channels:
+        if any(k in ch.upper() for k in NTL_KEYS):
+            return ch
+    return None
+
+# =============== ===============
+def process_one_city(root, city, spatial_subsample=10, sample_frac=0.4, rng=None):
+    cdir, files = city_files(root, city)
+    if not files:
+        print(f"[{city}] ⚠️ No .tif/.tiff data found in the directory; skipping.")
+        return None
+    print(f"\n[{city}] Detected {len(files)} image files.")
+
+    example_shape = None
+    all_months, all_channels = set(), set()
+    index_per_file = []  # (path, [(band, month_key, channel), ...])
+
+    for fn in tqdm(files, desc=f"[{city}] Scan file structure", unit="file"):
+        path = os.path.join(cdir, fn)
+        major = infer_var_from_filename(fn, city)
+        try:
+            with rasterio.open(path) as ds:
+                if example_shape is None:
+                    example_shape = (ds.height, ds.width)
+                else:
+                    if (ds.height,ds.width) != example_shape:
+                        print(f"[{city}] Inconsistent dimensions: {fn}, skip this file")
+                        continue
+                descs = get_band_descs(ds)
+                triples = []
+                for b in range(1, ds.count+1):
+                    ch, mk = parse_band_desc(descs[b-1], major)
+                    all_channels.add(ch)
+                    if mk!="STATIC": all_months.add(mk)
+                    triples.append((b, mk, ch))
+                index_per_file.append((path, triples))
+        except Exception as e:
+            print(f"[{city}] [Index skipping] {fn}: {repr(e)}")
+
+    if not index_per_file:
+        print(f"[{city}] ⚠️ No files available; skipping.")
+        return None
+
+    months   = sorted(all_months)   
+    channels = sorted(all_channels)
+    if CHANNEL_WHITELIST:
+        channels = [c for c in channels if c in CHANNEL_WHITELIST]
+
+    ch2i = {c:i for i,c in enumerate(channels)}
+    m2i  = {m:i for i,m in enumerate(months)}
+
+    H, W = example_shape
+    H2, W2 = out_hw(H, W, spatial_subsample)
+    T, C = len(months), len(channels)
+    print(f"[{city}] Number of months: {T} | Number of channels: {C} | Target size: H={H2}, W={W2}")
+
+    if T == 0 or C == 0:
+        print(f"[{city}] ⚠️ No time or channel available, skip.)
+        return None
+
+    # 2) Static Layer Cache (Average)
+    static_cache = {}   # c_idx -> (H2,W2)
+    for ch in channels:
+        acc, cnt = None, 0
+        for path, triples in index_per_file:
+            for b, mk, c in triples:
+                if c==ch and mk=="STATIC":
+                    try:
+                        with rasterio.open(path) as ds:
+                            x = read_downsample(ds, b, H2, W2)
+                    except Exception as e:
+                        print(f"[{city}] [STATICSkip] {os.path.basename(path)}: {repr(e)}")
+                        continue
+                    if acc is None:
+                        acc, cnt = x, 1
+                    else:
+                        m1 = np.isfinite(acc); m2 = np.isfinite(x); both = m1 & m2
+                        acc[~m1 &  m2] = x[~m1 & m2]
+                        acc[ both] = (acc[both]*cnt + x[both])/(cnt+1)
+                        cnt += 1
+        if acc is not None:
+            static_cache[ch2i[ch]] = acc
+
+# 3) Cumulative SUM/CNT (non-STATIC bands averaged monthly)
+    SUM = np.zeros((T, H2, W2, C), np.float32)
+    CNT = np.zeros((T, H2, W2, C), np.uint16)
+
+    def add_sumcnt(t_idx, c_idx, arr2d):
+        m = np.isfinite(arr2d)
+        if m.any():
+            SUM[t_idx, :arr2d.shape[0], :arr2d.shape[1], c_idx][m] += arr2d[m]
+            CNT[t_idx, :arr2d.shape[0], :arr2d.shape[1], c_idx][m] += 1
+
+    for path, triples in tqdm(index_per_file, desc=f"[{city}] Synthetic SUM/COUNT (by file)", unit="file"):
+        with rasterio.open(path) as ds:
+            oh, ow = out_hw(ds.height, ds.width, spatial_subsample)
+            per_bucket = defaultdict(list)
+            for b, mk, ch in triples:
+                if ch not in ch2i:
+                    continue
+                if mk=="STATIC" or mk not in m2i:
+                    continue
+                per_bucket[(m2i[mk], ch2i[ch])].append(b)
+            if not per_bucket:
+                continue
+            for (t_idx, c_idx), band_list in per_bucket.items():
+                band_list = sorted(band_list)
+                try:
+                    data = ds.read(indexes=band_list, masked=True,
+                                   out_shape=(len(band_list), oh, ow),
+                                   resampling=Resampling.average).astype(np.float32)
+                    if np.ma.isMaskedArray(data): data = data.filled(np.nan)
+                    arr = np.nanmean(data, axis=0).astype(np.float32)
+                    add_sumcnt(t_idx, c_idx, arr)
+                except Exception as e:
+                    print(f"[{city}] [File skipping] {os.path.basename(path)}: {repr(e)}")
+        gc.collect()
+
+    # 4) THWC = SUM/CNT + Static Layer Broadcast
+    THWC = np.full((T, H2, W2, C), np.nan, np.float32)
+    valid = CNT > 0
+    THWC[valid] = (SUM[valid] / CNT[valid]).astype(np.float32)
+    for c_idx, arr in static_cache.items():
+        THWC[:, :arr.shape[0], :arr.shape[1], c_idx] = arr
+
+# 5) Night vision mask + threshold
+    ntl_ch = find_ntl_index(channels)
+    if ntl_ch is not None:
+        ntl_cidx = ch2i[ntl_ch]
+        ntl_img  = THWC[0, :, :, ntl_cidx]
+        ntl_mask = np.isfinite(ntl_img) & (ntl_img > NTL_THRESHOLD)
+    else:
+        print(f"[{city}] ⚠️ No night-light channel found; default global participation")
+        ntl_mask = np.ones((H2,W2), dtype=bool)
+    pix_idx = np.flatnonzero(ntl_mask.ravel())
+    n_pix = pix_idx.size
+    print(f"[{city}] Night Vision Mask: Effective Pixels {n_pix}/{H2*W2}（{n_pix/(H2*W2)*100:.2f}%）")
+
+    if n_pix < MIN_CITY_PIXELS:
+        print(f"[{city}] ⚠️ Fewer than the threshold number of effective pixels {MIN_CITY_PIXELS}，skip")
+        return None
+
+6) Select the y channel (daytime LST priority)
+    target_ch = choose_target_channel(channels)
+    if not target_ch:
+        print(f"[{city}] ⚠️ LST target channel not found, skipping.")
+        return None
+    y_cidx = ch2i[target_ch]
+
+7) Unfolding → Joining (monthly)
+    X_list, y_list = [], []
+    for t in range(T):
+        slab = THWC[t]                         # (H2,W2,C)
+        feat = slab.reshape(-1, C)[pix_idx]    
+        yy   = slab[..., y_cidx].reshape(-1)[pix_idx]
+        mask = np.isfinite(yy) & np.any(np.isfinite(feat), axis=1)
+        if not mask.any():
+            continue
+        feat = feat[mask]; yy = yy[mask]
+        X_list.append(feat); y_list.append(yy)
+
+    if not X_list:
+        print(f"[{city}] ⚠️ No valid samples found; skipping.")
+        return None
+
+    X_city = np.concatenate(X_list, axis=0).astype(np.float32)
+    y_city = np.concatenate(y_list, axis=0).astype(np.float32)
+    print(f"[{city}] After flattening：X={X_city.shape}, y={y_city.shape}")
+
+8) Sampling (per city)
+    if 0 < sample_frac < 1.0 and X_city.shape[0] > 0:
+        rng = np.random.default_rng(RANDOM_SEED) if rng is None else rng
+        keep = rng.choice(X_city.shape[0], size=int(round(sample_frac*X_city.shape[0])), replace=False)
+        X_city, y_city = X_city[keep], y_city[keep]
+        print(f"[{city}] After sampling：X={X_city.shape}, y={y_city.shape}")
+
+    return {"city": city, "X": X_city, "y": y_city, "channels": channels, "target_ch": target_ch}
+
+# =============== Primary Process: Multi-City Merge (Limited to 3 Cities + Threshold) ===============
+all_cities = list_cities(ROOT)
+assert all_cities, f"No city subdirectories found under {ROOT}"
+cities_ordered = apply_city_whitelist(all_cities, CITY_WHITELIST)
+
+print(f"Number of cities discovered：{len(all_cities)}")
+print(f"Processing sequence (priority given to {CITY_LIMIT} first)：{cities_ordered[:CITY_LIMIT]}")
+
+per_city = []
+for city in cities_ordered:
+    if len(per_city) >= CITY_LIMIT:
+        break
+    res = process_one_city(ROOT, city, SPATIAL_SUBSAMPLE, SAMPLE_FRAC)
+    if res is not None:
+        per_city.append(res)
+
+assert per_city, "No city has reached the threshold or generated a valid sample."
+
+# 1) Identify the intersection channel
+channel_sets = [set(x["channels"]) for x in per_city]
+common_channels = sorted(set.intersection(*channel_sets))
+if CHANNEL_WHITELIST:
+    common_channels = sorted(set(common_channels) & set(CHANNEL_WHITELIST))
+
+# 2) Exclude the LST* channel from the features
+if EXCLUDE_LST_FEATURES:
+    common_channels = [c for c in common_channels if "LST" not in c.upper()]
+print(f"Number of Feature Channels (Intersection & Exclusion LST*)：{len(common_channels)}")
+
+# 3) Merge and append META.CITY_ID
+city2id = {c["city"]: i for i, c in enumerate(per_city)}
+allX, ally, used_city_names = [], [], []
+
+for item in per_city:
+    chs = item["channels"]
+    col_idx = [chs.index(c) for c in common_channels] if common_channels else []
+    Xc = item["X"][:, col_idx] if col_idx else item["X"][:, []]
+    cid_col = np.full((Xc.shape[0], 1), city2id[item["city"]], dtype=np.float32)
+    Xc = np.hstack([Xc, cid_col])
+    allX.append(Xc)
+    ally.append(item["y"])
+    used_city_names.extend([item["city"]] * Xc.shape[0])
+
+X = np.vstack(allX).astype(np.float32)
+y = np.concatenate(ally).astype(np.float32)
+channels_final = common_channels + ["META.CITY_ID"]
+
+print(f"\n✅ Merger completed:X={X.shape}, y={y.shape}")
+print(f"City of use:{sorted(set(used_city_names))}")
+print(f"Feature Channel（{len(channels_final)}）：{channels_final}")
+
+# 4) Save
+np.savez_compressed(
+    OUT_NPZ,
+    X=X, y=y, channels=np.array(channels_final, dtype=object),
+    used_cities=np.array(sorted(set(used_city_names)), dtype=object),
+    note=f"Top{CITY_LIMIT} cities with >= {MIN_CITY_PIXELS} NTL-masked pixels; LST* excluded; META.CITY_ID appended"
+)
+print(f"📦 saved：{OUT_NPZ}")
